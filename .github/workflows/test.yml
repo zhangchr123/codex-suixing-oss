@@ -1,0 +1,51 @@
+name: Tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+env:
+  PYTHONUTF8: '1'
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m unittest -v
+      - run: node test_desktop.mjs
+      - run: node test_chatgpt.mjs
+      - run: node test_markdown.cjs
+      - run: node test_polling.cjs
+      - run: python scripts/audit_source.py
+      - name: Check macOS launcher and LaunchAgent
+        if: runner.os == 'macOS'
+        run: |
+          zsh -n 'Start macOS.command'
+          python -c "import companion, plistlib; from pathlib import Path; Path('/tmp/suixing-test.plist').write_bytes(plistlib.dumps(companion.launch_agent(Path('/tmp/suixing test'))))"
+          plutil -lint /tmp/suixing-test.plist
+  android-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Prepare Android SDK
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Build with example origin and disposable signing key
+        run: python android/build.py --connection deployment/connection.example.json
+      - run: python scripts/audit_source.py

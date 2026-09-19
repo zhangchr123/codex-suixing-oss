@@ -1,0 +1,27 @@
+# Never commit runtime data, private connection configuration, keys or builds.
+.state/
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+connection.json
+password*.txt
+*-password.txt
+*.log
+*.sqlite*
+*.db
+*.pem
+*.key
+*.crt
+*.p12
+*.jks
+!testdata/localhost-test-only.pem
+build/
+dist/
+downloads/
+*.apk
+*.apk.sha256
+.DS_Store
+Thumbs.db

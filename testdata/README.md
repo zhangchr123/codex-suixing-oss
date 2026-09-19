@@ -1,0 +1,1 @@
+`localhost-test-only.pem` is a public, disposable certificate and key for the local TLS regression test. It is not a production credential and is not included by either deployment script or the Android build.

@@ -1,0 +1,25 @@
+[Unit]
+Description=Codex Suixing private conversation relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=codexsync
+Group=codexsync
+WorkingDirectory=/home/codexsync/.local/share/codex-viewer
+ExecStart=/usr/bin/python3 /home/codexsync/.local/share/codex-viewer/viewer.py serve --host 0.0.0.0 --port 443 --cert /home/codexsync/.local/share/codex-viewer/.state/server.crt --key /home/codexsync/.local/share/codex-viewer/.state/server.key
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/codexsync/.local/share/codex-viewer/.state
+PrivateTmp=true
+MemoryMax=192M
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target

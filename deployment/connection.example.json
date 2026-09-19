@@ -1,0 +1,9 @@
+{
+  "sshHost": "my-relay",
+  "url": "https://relay.example.com/",
+  "remotePython": "python3",
+  "control": false,
+  "contextThreadId": "",
+  "desktopEndpoint": "",
+  "nodePath": ""
+}
