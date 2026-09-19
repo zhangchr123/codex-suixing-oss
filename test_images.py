@@ -37,7 +37,7 @@ class ImageTests(unittest.TestCase):
             bridge.deliver([job], viewer.atomic_write)
             path = Path(calls[0]["imagePaths"][0])
             self.assertEqual(path.read_bytes(),base64.b64decode(PNG))
-            self.assertTrue(path.is_relative_to(root / ".state/incoming"))
+            self.assertTrue(path.is_relative_to((root / ".state/incoming").resolve()))
             bridge.deliver([job], viewer.atomic_write)
             self.assertEqual(len(calls),1)
             broken = {**job,"id":str(uuid.uuid4()),"imageData":[]}
