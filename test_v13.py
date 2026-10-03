@@ -26,7 +26,7 @@ class UpgradeTests(unittest.TestCase):
             (root / '.state/relocated-paths.json').write_text(json.dumps({str(old): str(incoming)}), encoding='utf-8')
             mirror = MediaMirror(root, Path(directory) / 'codex')
             self.assertIsNotNone(mirror.local_image(str(old / 'image.png'), ''))
-            self.assertTrue(mirror.store.directory.is_relative_to(root))
+            self.assertTrue(mirror.store.directory.is_relative_to(root.resolve()))
 
     def test_explicit_images_only_and_original_preserved(self):
         with tempfile.TemporaryDirectory() as directory:

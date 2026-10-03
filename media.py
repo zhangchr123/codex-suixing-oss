@@ -88,7 +88,7 @@ class MediaMirror:
         path = path.resolve()
         for before, after in self.relocations.items():
             try:
-                path = (Path(after) / path.relative_to(Path(before))).resolve()
+                path = (Path(after) / path.relative_to(Path(before).resolve())).resolve()
                 break
             except ValueError:
                 continue

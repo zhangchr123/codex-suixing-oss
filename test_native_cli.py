@@ -130,8 +130,8 @@ class NativeTests(unittest.TestCase):
             self.assertEqual(result['status'], 'sent')
             self.assertEqual(session.engines[ID].calls[-1][1]['input'][1]['path'], str(image.resolve()))
             bridge = DesktopBridge(root, state)
-            self.assertEqual(bridge.native.endpoint, state / 'native-endpoint.json')
-            self.assertEqual(bridge.receipts_file, state / 'delivery-receipts.json')
+            self.assertEqual(bridge.native.endpoint, (state / 'native-endpoint.json').resolve())
+            self.assertEqual(bridge.receipts_file, (state / 'delivery-receipts.json').resolve())
             self.assertFalse((root / '.state').exists())
 
     def test_live_assistant_progress_excludes_reasoning(self):
