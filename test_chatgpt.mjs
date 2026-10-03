@@ -10,4 +10,6 @@ assert.deepEqual(transcript.messages.map(m=>m.role),['user','assistant','user','
 assert.equal(transcript.messages[0].text,'第一轮');assert.equal(transcript.messages[1].text,'# 标题');
 assert.match(transcript.messages[3].text,/请在电脑/);assert.doesNotMatch(JSON.stringify(transcript),/秘密|不要导出/);
 assert.equal(transcript.loaded,true);assert.equal(transcript.truncated,true);assert.equal(transcript.status,'running');
+const marked=chatTranscript({turns:[{startedAt:1,items:[{type:'userMessage',content:[{type:'text',text:'手机消息\n\n<codex_suixing_message_id>33333333-3333-3333-3333-333333333333</codex_suixing_message_id>'}]}]}]},summary);
+assert.equal(marked.messages[0].requestId,'33333333-3333-3333-3333-333333333333');assert.equal(marked.messages[0].text,'手机消息');
 console.log('ChatGPT classification, ordering, formatting and private-item filtering passed');

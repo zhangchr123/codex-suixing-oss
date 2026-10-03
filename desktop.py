@@ -26,7 +26,7 @@ def main():
     ttk.Label(panel, text="把这台电脑的对话同步到自己的服务器", padding=(0, 8, 0, 16)).grid(row=1, column=0, columnspan=2, sticky="w")
     fields = {}
     definitions = [("sshHost", "SSH 主机别名"), ("url", "HTTPS 网页地址"), ("codexHome", "Codex 数据目录"),
-        ("contextThreadId", "上下文任务 ID"), ("desktopEndpoint", "桌面连接路径（Mac 必填）"),
+        ("contextThreadId", "ChatGPT 桌面上下文 ID（可选）"), ("desktopEndpoint", "ChatGPT 桌面连接路径（Mac）"),
         ("nodePath", "Node 路径（留空自动查找）"), ("remotePython", "服务器 Python")]
     config = {}
     if (state / "connection.json").exists():

@@ -1,28 +1,25 @@
-# 本机 Codex 桌面连接
+# 本机发送与桌面连接
 
-本项目通过已安装 Codex 桌面应用的本地 App Tools 通道读取已有聊天、发送文字或新建 Codex 任务。它不是 OpenAI 开发者 API，不需要 API Key，也不导出账号登录凭据。
+Codex 任务使用官方 CLI 的 app-server，普通 ChatGPT 聊天使用已登录桌面的本地 App Tools 通道。模型调用留在电脑，不需要开发者 API Key，也不向服务器上传 Cookie、登录文件或账户令牌。
 
-该通道属于内部协议，并非稳定的第三方 SDK。发现工具缺失或连接异常时会显示离线，不改用未公开的 ChatGPT 网络接口。普通 ChatGPT Chat 新建、附件上传暂不支持。
+## Codex
 
-## 配置自己的上下文
+安装 CLI、完成自己的登录，在随行界面勾选启用发送即可。原生新建、续聊使用 thread/start、thread/resume、turn/start，图片作为独立 localImage 输入。选项来自真实 model/list；手机可以选择模型及思考强度、处理原生确认和补充问题。
 
-1. 在 Codex 桌面版保留一个自己的本地任务，例如专门用于手机桥接的任务。取得其完整任务 UUID；本地 `~/.codex/sessions/` 对应日志的 `session_meta.id` 中可以找到。不要把日志整份上传或发给其他人。
-2. 在电脑端“上下文任务 ID”填这个 UUID。它是本机工具调用的上下文，不是要发送消息的目标任务。代码不会自带其他用户的 UUID。
-3. Windows 会尝试发现本机 `codex-browser-use-*` 命名管道，也允许显式填写连接路径。
-4. macOS 填写 Codex 所提供的本机 Unix socket 路径。可以在自己的 Codex 任务中让它**只查看环境变量 `CODEX_APP_TOOLS_PIPE_PATH` 的值**；请勿读取、复制或上传 `auth.json`、Cookie 或令牌。若该变量不存在或安装版本未提供兼容通道，当前版本无法启用控制功能，不能假定某个 socket 路径必然存在。
-5. 勾选启用发送，保存后点击连接诊断；或运行 `python3 companion.py doctor --desktop`。该检查只读取本机工具目录和项目列表，不创建任务或发送文字。
+桌面持有某个对话的写入权时，第二个 CLI 可能无法接管。此时显示失败，不借另一项任务转发，也不把“入队成功”当作开始执行。手机新建任务可直接运行。每轮结束 2 秒后关闭对应引擎，便于桌面继续使用同一份本地历史。
 
-也可用命令行初次创建配置：
+运行中的 CLI 引擎由独立本地服务持有，同步进程重启不杀模型任务。图片、回执和回环接口令牌放在配置目录内；接口仅监听本机回环地址，手机只能访问认证后的服务器队列。结果不确定时不自动重发。
 
-```sh
-python3 companion.py init --ssh-host my-relay --url https://relay.example.com/ \
-  --enable-control --context-thread YOUR_OWN_TASK_UUID --endpoint /path/to/your/socket
-```
+## 普通 ChatGPT 聊天
 
-已有配置不会被 `init` 覆盖；使用图形界面修改。自启使用保存的配置，不能依赖另一个终端中临时设置的环境变量。桌面重启后若 socket 路径变化，需要更新配置。运行环境可直接提供 `CODEX_APP_TOOLS_PIPE_PATH`，但界面中的显式配置优先。
+1. 在自己的 Codex 桌面保留一个本人可访问的任务，并把 UUID 填入可选“ChatGPT 桌面上下文 ID”。它只用于普通 ChatGPT 和项目读取，Codex 原生发送不依赖它。
+2. Windows 自动发现当前用户桌面管道；macOS 配置实际存在的 App Tools Unix socket，可从自己的运行环境 CODEX_APP_TOOLS_PIPE_PATH 核对。不要读取或复制 auth.json、Cookie 或令牌。
+3. 用 python3 companion.py doctor --desktop 检查本机目录与连接。诊断只读，不发送消息。
 
-## 范围
+桌面更新可能改变内部协议。普通 ChatGPT Chat 目前仅支持查看和文字续聊；新建、原有附件及图片仍在电脑操作。关闭随行界面后同步继续。
 
-只允许读取任务、列出本机项目、创建 Codex 任务及发送消息。接收方类型和本机归属会再次核对；手机不能指定任意本机文件作为图片。图片来自认证上传并存入私有目录。项目任务的权限沿用 Codex 当前设置，审批仍需在桌面处理。
+## 私有目录与迁移
 
-归档上下文任务在原 Windows 部署中经过用户验证可用。删除任务、退出 Codex、电脑休眠会影响连接，应保留上下文任务。关闭随行界面不会关闭同步进程。
+Windows 默认使用程序目录下 .state，macOS 和 Linux 默认使用用户数据目录，也可显式指定 --state-dir。该目录包含照片、预览、两层防重复回执、配置、日志和回环令牌，不进入 Git。
+
+移动程序时保留整个状态目录，再重建自启，更新 SSH 的绝对主机密钥路径。不要同时运行两份镜像。CLI 登录与 Codex 对话日志仍由官方 CLI 管理，本项目不会自行迁移它们。

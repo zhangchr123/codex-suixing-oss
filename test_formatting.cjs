@@ -1,0 +1,14 @@
+const assert=require('node:assert/strict');
+const {cleanDisplayText}=require('./formatting');
+const mem='<oai-mem-citation>\n<citation_entries>private metadata</citation_entries>\n<rollout_ids>id</rollout_ids>\n</oai-mem-citation>';
+assert.equal(cleanDisplayText('完整回复\n'+mem),'完整回复');
+assert.equal(cleanDisplayText('<heartbeat><instructions>自动检查</instructions></heartbeat>','user'),'');
+assert.equal(cleanDisplayText('<codex_internal_context source="goal"><objective>执行</objective></codex_internal_context>','user'),'');
+assert.equal(cleanDisplayText('<in-app-browser-context source="ambient">自动信息</in-app-browser-context>\n\n## My request:\n还有多久','user'),'还有多久');
+assert.equal(cleanDisplayText('<image name="1" path="a.png">![图片](/api/media/example.png)</image>','user'),'![图片](/api/media/example.png)');
+assert.equal(cleanDisplayText('# Files mentioned by the user:\n\n## clipboard.png: C:/Temp/clipboard.png\nImage attachment: true\n\n## My request:\n请看这里\n<image name="1">![图](/api/media/opaque.png)</image>','user'),'请看这里\n![图](/api/media/opaque.png)');
+const code='```html\n'+mem+'\n```';assert.equal(cleanDisplayText(code),code);
+const inline='这里是 `<oai-mem-citation>` 标签';assert.equal(cleanDisplayText(inline),inline);
+assert.equal(cleanDisplayText('![图](<D:/my folder/chart.png>)'),'![图](<D:/my folder/chart.png>)');
+assert.equal(cleanDisplayText('```html\n<div>合法代码示例</div>\n```'),'```html\n<div>合法代码示例</div>\n```');
+console.log('Display formatting: metadata, automation and image envelopes filtered; literal code and image links preserved');

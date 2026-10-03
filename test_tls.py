@@ -13,6 +13,26 @@ CERTIFICATE = Path(__file__).parent / "testdata/localhost-test-only.pem"
 
 
 class TLSIsolationTests(unittest.TestCase):
+    def test_https_reuses_connection(self):
+        with tempfile.TemporaryDirectory() as folder:
+            server = viewer.make_server('127.0.0.1', 0, Path(folder), 'test-password-long-enough', tls=True)
+            viewer.configure_tls(server, CERTIFICATE, CERTIFICATE)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            client = http.client.HTTPSConnection('127.0.0.1', server.server_port,
+                context=ssl.create_default_context(cafile=str(CERTIFICATE)), timeout=2)
+            try:
+                ports = []
+                for _ in range(3):
+                    client.request('GET', '/health')
+                    response = client.getresponse()
+                    self.assertEqual(response.version, 11)
+                    response.read()
+                    self.assertIsNotNone(client.sock)
+                    ports.append(client.sock.getsockname()[1])
+                self.assertEqual(len(set(ports)), 1)
+            finally:
+                client.close();server.shutdown();server.server_close()
+
     def test_stalled_and_partial_handshakes_leave_https_responsive(self):
         with tempfile.TemporaryDirectory() as folder:
             server = viewer.make_server("127.0.0.1", 0, Path(folder), "test-password-long-enough", tls=True)

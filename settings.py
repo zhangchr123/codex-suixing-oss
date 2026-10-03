@@ -16,7 +16,7 @@ def default_state(platform=None, home=None):
     if platform == "darwin":
         return home / "Library/Application Support/CodexSuixing"
     if platform == "win32":
-        return Path(os.environ.get("LOCALAPPDATA", home / "AppData/Local")) / "CodexSuixing"
+        return ROOT / '.state'
     return Path(os.environ.get("XDG_STATE_HOME", home / ".local/state")) / "codex-suixing"
 
 
@@ -54,8 +54,6 @@ def validate(config):
         raise ValueError("上下文任务 ID 应为完整的小写 UUID")
     if not isinstance(config.get("control", False), bool):
         raise ValueError("control 必须是 true 或 false")
-    if config.get("control") and not context:
-        raise ValueError("启用发送前，请填写自己的 Codex 上下文任务 ID")
     for key in ("remotePython", "codexHome", "desktopEndpoint", "nodePath", "hostname"):
         value = config.get(key, "")
         if not isinstance(value, str) or any(c in value for c in "\n\r\x00"):
@@ -79,6 +77,7 @@ def save_config(state, config):
 def bridge_env(state, config):
     env = dict(os.environ)
     env["CODEX_SUIXING_STATE_DIR"] = str(state)
+    env["CODEX_HOME"] = config["codexHome"]
     env["CODEX_SUIXING_CONTEXT_THREAD_ID"] = config.get("contextThreadId", "")
     if config.get("desktopEndpoint"):
         env["CODEX_APP_TOOLS_PIPE_PATH"] = config["desktopEndpoint"]

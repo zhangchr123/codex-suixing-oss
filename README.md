@@ -2,18 +2,20 @@
 
 用自己的服务器，把电脑上的 Codex 对话带到手机。支持 Windows、macOS 电脑端，手机浏览器和可自行构建的 Android App。
 
-无需 OpenAI 开发者 API Key。对话执行仍由电脑上已登录的 Codex 桌面版完成；服务器只负责同步、网页与消息队列。这是社区项目，与 OpenAI 无隶属关系。
+无需 OpenAI 开发者 API Key。Codex 对话由电脑上已登录的官方 CLI 执行；普通 ChatGPT 聊天使用桌面现有通道。服务器只负责缓存、网页与消息队列。这是社区项目，与 OpenAI 无隶属关系。
 
 ## 功能
 
 - 手机查看 Markdown、代码、表格，折叠较长消息与发送回执。
 - Codex 任务续聊、新建独立任务或本机项目任务；发送最多 4 张图片。
 - 将桌面已有的 ChatGPT 聊天单独列出，按需加载、文字续聊。
-- 空闲每轮等待 5 秒，有交流后等待 2 秒，持续 3 分钟；显示连接延迟和同步时间。
+- 活跃目标周期 1 秒、空闲 10 秒，交流或前台查看激活 3 分钟窗口；持续 SSH 连接避免每轮重新登录。
+- 原生文字与独立图片输入，动态模型及思考强度选择；助手正文增量、图片预览、Markdown 和本地公式渲染。
+- 手机紧凑布局、App 专用布局、浅色/深色主题；缓存内容先显示再后台更新。
 - Android 首次绑定后，使用系统指纹或锁屏凭据解锁，无需反复输入网页密码。
-- 电脑端图形界面、后台启停、连接诊断和登录自启。服务器仅依赖 Python 标准库。
+- 电脑端图形界面、异常退出自动恢复、Windows 托盘、后台启停、连接诊断和登录自启。服务器仅依赖 Python 标准库。
 
-**兼容性边界：** 本地日志同步使用跨平台 Python。消息发送和 ChatGPT 功能依赖 Codex 桌面应用的内部 App Tools 协议，属于实验性适配，桌面更新可能改变协议。Windows 已有实际使用；macOS 提供 Unix socket 适配与自动测试，但尚未完成已登录 Codex 的实机端到端验证。普通 ChatGPT Chat 的新建和图片附件目前不可用，不能用 Codex 任务代替。
+**兼容性边界：** Codex 使用原生 `app-server` 协议。桌面持有写入权的旧对话可能无法接管，此时明确失败，不自动跨任务转发；每轮完成后释放 CLI 写入权。普通 ChatGPT 功能仍依赖桌面内部协议。Windows 有实际使用及真实 CLI 隔离协议验证；macOS 提供跨平台与 Unix socket 测试，尚未完成已登录账号的实机端到端验证。普通 ChatGPT Chat 新建和图片仍不可用。云任务仅同步列表与状态。
 
 ## 架构
 
@@ -22,7 +24,8 @@ flowchart LR
   Phone[手机浏览器 / Android] <-->|HTTPS| Relay[自己的 Linux 服务器]
   PC[Windows / macOS 同步程序] <-->|主动 SSH 同步| Relay
   Logs[本地 Codex 对话日志] --> PC
-  PC <-->|本机管道 / Unix socket| App[已登录的 Codex 桌面版]
+  PC <-->|原生标准输入输出| CLI[已登录的 Codex CLI]
+  PC <-->|普通 ChatGPT：本机管道 / Unix socket| App[Codex 桌面版]
 ```
 
 手机只需能连接服务器。电脑需要能访问 Codex / ChatGPT，并保持联网和唤醒。服务器不会收到 Codex 登录文件或账户令牌；它会保存你同步的对话正文与上传图片。请使用自己信任的服务器。
@@ -30,9 +33,9 @@ flowchart LR
 ## 开始使用
 
 1. 准备一台 Linux 服务器，安装 Python 3.11+，按 [服务器部署](docs/server.md) 配置专用账号、SSH 和 HTTPS。
-2. 电脑安装 Python 3.11+；发送功能还需要 Node.js 20+ 和已登录的 Codex 桌面版。
+2. 电脑安装 Python 3.11+、Pillow（`python3 -m pip install Pillow`）及已登录的 Codex CLI；普通 ChatGPT 功能另外需要 Node.js 20+ 与已登录桌面版。
 3. 下载源码并放在固定目录。Windows 双击 `Start Windows.cmd`；Mac 见 [macOS 安装](docs/macos.md)，双击 `Start macOS.command` 或 Release 中的 `.app`。
-4. 在电脑端填写 SSH 别名、HTTPS 地址，保存并启动。首次只开启对话同步；按 [桌面连接](docs/desktop-bridge.md) 填写自己的上下文任务 ID 和连接路径，再启用发送。
+4. 在电脑端填写 SSH 别名、HTTPS 地址，保存并启动。启用 Codex 发送不需要借用上下文任务；普通 ChatGPT 功能按 [桌面连接](docs/desktop-bridge.md) 配置自己的上下文与连接路径。
 5. 手机打开自己的 HTTPS 地址，用部署时生成的密码登录。需要 App 时按 [Android 构建](android/README.md) 操作。
 
 ### 命令行
@@ -49,17 +52,19 @@ python3 companion.py autostart
 python3 companion.py autostart --disable
 ```
 
-`python3 desktop.py` 打开图形界面。关闭界面后同步继续；停止按钮等当前传输完成后退出。更改配置前先停止同步。移动程序目录后，请重新设置自启。Linux 暂不自动安装自启服务，可用 `companion.py run` 配合自己的服务管理器。
+`python3 desktop.py` 打开图形界面。关闭界面后同步继续；停止按钮等当前传输完成后退出。更改配置前先停止同步。移动程序目录后重新设置自启，并更新 SSH 配置中绝对路径的主机密钥文件。Linux 可用 `companion.py supervise` 配合自己的服务管理器。
+
+Windows 启动后带原生托盘：双击打开网页，右键查看状态、暂停/恢复、重启、打开日志、控制登录自启或退出。正常为绿、连接异常为黄、暂停为灰。重复启动保留单个同步及托盘实例；同步重启不会终止独立 CLI 模型服务。
 
 ### 私有配置
 
 | 平台 | 默认配置、图片、回执和日志目录 |
 | --- | --- |
 | macOS | `~/Library/Application Support/CodexSuixing/` |
-| Windows | `%LOCALAPPDATA%\CodexSuixing\` |
+| Windows | `<程序目录>\.state\`，图片随程序所在磁盘保存 |
 | Linux | `$XDG_STATE_HOME/codex-suixing/`，默认 `~/.local/state/codex-suixing/` |
 
-可用 `--state-dir` 或 `CODEX_SUIXING_STATE_DIR` 覆盖。模板见 [connection.example.json](deployment/connection.example.json)。上下文任务 ID、桌面连接路径、服务器地址均由使用者自己配置；源码不内置任何人的部署入口或账号。
+可用 `--state-dir` 或 `CODEX_SUIXING_STATE_DIR` 覆盖。图片在该目录的 `incoming/`、预览在 `media-local/`，配置、回执和私有回环令牌也在同一目录。模板见 [connection.example.json](deployment/connection.example.json)。服务器地址、普通 ChatGPT 上下文及连接路径均由使用者配置；源码不内置个人部署入口或账号。迁移图片路径可用私有 `relocated-paths.json` 映射旧目录到新目录，保留旧历史中的预览。
 
 ## 同步范围
 
@@ -77,6 +82,9 @@ node test_desktop.mjs
 node test_chatgpt.mjs
 node test_markdown.cjs
 node test_polling.cjs
+node test_timeline.cjs
+node test_math.cjs
+node test_formatting.cjs
 python3 scripts/audit_source.py
 ```
 

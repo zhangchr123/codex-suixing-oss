@@ -1,0 +1,14 @@
+const assert=require('node:assert/strict');
+const merge=require('./timeline.js');
+const created=Date.parse('2026-10-03T10:00:00Z')/1000;
+const receipts=[{id:'a',text:'继续',created,status:'sent',args:{}},{id:'b',text:'继续',created:created+1,status:'queued',args:{images:[{id:'image.png'}]}}];
+let rows=merge([{role:'user',text:'继续',time:'2026-10-01T10:00:00Z'},{role:'user',text:'继续',requestId:'a',time:'2026-10-03T10:00:02Z'}],receipts);
+assert.equal(rows.length,3);assert.equal(rows.filter(r=>r.requestId==='a').length,1);assert.equal(rows.find(r=>r.requestId==='b').delivery.status,'queued');assert.deepEqual(rows.find(r=>r.requestId==='b').images,['image.png']);
+rows=merge([{role:'user',text:'继续',time:'2026-10-03T10:00:02Z'},{role:'user',text:'继续',time:'2026-10-03T10:00:03Z'}],receipts.map(r=>({...r,status:'sent'})));
+assert.equal(rows.length,2);assert.deepEqual(rows.map(r=>r.requestId),['a','b']);
+rows=merge([],[{...receipts[0],status:'failed',detail:'no connection'}]);assert.equal(rows[0].delivery.detail,'no connection');
+const photo='a'.repeat(64)+'.jpg';
+rows=merge([{role:'user',text:'图片内容？\n![附件图片](/api/media/'+photo+')',time:'2026-10-03T10:00:02Z'}],[{id:'native-photo',text:'图片内容？',created,status:'sent',args:{images:[{id:photo}]}}]);
+assert.equal(rows.length,1);assert.equal(rows[0].requestId,'native-photo');
+assert.ok(rows[0].text.includes('/api/media/'));
+console.log('Timeline reconciliation: queued images, exact IDs, repeated text, historical messages and failures passed');

@@ -1,5 +1,5 @@
 const iso=value=>new Date((Number(value)||0)*1000).toISOString();
-const clean=text=>String(text||'').replace(/:chatgpt-content-reference\{[^}]*\}/g,'[图片或附件：请在电脑上的 ChatGPT 查看]');
+const clean=text=>String(text||'').replace(/<codex_suixing_message_id>[0-9a-f-]{36}<\/codex_suixing_message_id>/g,'').replace(/\s*<oai-mem-citation>[\s\S]*?<\/oai-mem-citation>\s*$/,'').trim().replace(/:chatgpt-content-reference\{[^}]*\}/g,'[图片或附件：请在电脑上的 ChatGPT 查看]');
 export function chatSummary(row, cached) {
   return {id:row.id,kind:'chatgpt',title:row.title||'ChatGPT 对话',workspace:'ChatGPT',updatedAt:iso(row.updatedAt),status:row.status==='active'?'running':'idle',messages:cached?.messages||[],loaded:!!cached?.loaded,truncated:!!cached?.truncated};
 }
@@ -9,7 +9,8 @@ export function chatTranscript(data, summary) {
     for(const item of turn.items||[]) {
       if(item.type==='userMessage') {
         const text=(item.content||[]).map(c=>c.type==='text'?c.text:'[附件：请在电脑上的 ChatGPT 查看]').join('\n');
-        if(text)messages.push({role:'user',text:clean(text),phase:'',time:iso(turn.startedAt)});
+        const marker=/<codex_suixing_message_id>([0-9a-f-]{36})<\/codex_suixing_message_id>/.exec(text);
+        if(text)messages.push({role:'user',text:clean(text),phase:'',time:iso(turn.startedAt),...(marker?{requestId:marker[1]}:{})});
       } else if(item.type==='agentMessage' && item.text) {
         messages.push({role:'assistant',text:clean(item.text),phase:'final',time:iso(turn.completedAt||turn.startedAt)});
       }

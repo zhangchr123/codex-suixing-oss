@@ -37,7 +37,7 @@ class ImageTests(unittest.TestCase):
             bridge.deliver([job], viewer.atomic_write)
             path = Path(calls[0]["imagePaths"][0])
             self.assertEqual(path.read_bytes(),base64.b64decode(PNG))
-            self.assertTrue(path.is_relative_to((root / ".state/incoming").resolve()))
+            self.assertTrue(path.is_relative_to(root / ".state/incoming"))
             bridge.deliver([job], viewer.atomic_write)
             self.assertEqual(len(calls),1)
             broken = {**job,"id":str(uuid.uuid4()),"imageData":[]}
@@ -47,12 +47,16 @@ class ImageTests(unittest.TestCase):
             text, ids = extract_images('问题\n\n<codex_suixing_images>\n"C:/private/'+refs[0]["id"]+'"\n</codex_suixing_images>')
             self.assertEqual(text,"问题")
             self.assertEqual(ids,[refs[0]["id"]])
+            attachment = '问题\n\n附图（手机上传，请用 view_image 查看后回答）：\n![附图 1](<C:\\repo\\.state\\incoming\\'+refs[0]['id']+'>)'
+            self.assertEqual(extract_images(attachment),("问题",[refs[0]['id']]))
+            ordinary = '用户写的图片\n![附图 1](<C:/pictures/'+refs[0]['id']+'>)'
+            self.assertEqual(extract_images(ordinary),(ordinary,[]))
 
     def test_authenticated_upload_and_chat_channel_routing(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder)
             batch={"order":[CODEX,CHAT],"threads":[{"id":CODEX,"kind":"codex","messages":[]},{"id":CHAT,"kind":"chatgpt","messages":[],"loaded":False}],"syncedAt":viewer.now(),
-                   "bridge":{"connected":True,"threadIds":[CODEX],"chatgptConnected":True,"chatgptThreadIds":[CHAT]}}
+                   "bridge":{"connected":True,"threadIds":[CODEX],"chatgptConnected":True,"chatgptThreadIds":[CHAT],"models":[{"id":"gpt-5.5","efforts":["low","high"]}]}}
             viewer.ingest(root,batch)
             server=viewer.make_server("127.0.0.1",0,root,"test-password-long-enough")
             threading.Thread(target=server.serve_forever,daemon=True).start()
@@ -82,6 +86,14 @@ class ImageTests(unittest.TestCase):
                 self.assertEqual(MessageQueue(root).for_thread(CHAT)[0]["args"]["channel"],"chatgpt")
                 self.assertEqual(req("GET",f"/api/threads/{CHAT}",headers=auth)[0],200)
                 self.assertIn(CHAT,json.loads((root/"chat-views.json").read_bytes()))
+                settings={"text":"带设置的消息","requestId":str(uuid.uuid4()),"model":"gpt-5.5","thinking":"high"}
+                status,raw,_=req("POST",f"/api/threads/{CODEX}/messages",settings,auth)
+                self.assertEqual(status,202);self.assertEqual(json.loads(raw)['args']['thinking'],'high')
+                for change in ({"model":"fake"},{"thinking":"ultra"},{"model":None}):
+                    self.assertEqual(req("POST",f"/api/threads/{CODEX}/messages",{**settings,**change,"requestId":str(uuid.uuid4())},auth)[0],400)
+                self.assertEqual(req("POST",f"/api/threads/{CHAT}/messages",{**settings,"requestId":str(uuid.uuid4())},auth)[0],400)
+                status,raw,_=req("POST","/api/threads/new",{**settings,"requestId":str(uuid.uuid4())},auth)
+                self.assertEqual(status,202);self.assertEqual(json.loads(raw)['args']['model'],'gpt-5.5')
                 batch["bridge"]["chatgptConnected"]=False;viewer.ingest(root,batch)
                 self.assertEqual(req("POST",f"/api/threads/{CHAT}/messages",{**chat,"requestId":str(uuid.uuid4())},auth)[0],409)
                 self.assertEqual(req("GET","/api/images/../password.txt",headers=auth)[0],404)

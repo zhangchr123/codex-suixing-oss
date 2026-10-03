@@ -17,36 +17,36 @@ class ViewerTests(unittest.TestCase):
         cadence = viewer.SyncCadence(clock=lambda: clock[0])
         thread = {"id": ID, "messages": [{"text":"old message"}], "updatedAt":"first"}
         cadence.observe([thread])
-        self.assertEqual(cadence.interval(), 5)
+        self.assertEqual(cadence.interval(), 10)
         clock[0] += 10
         cadence.observe([{**thread, "updatedAt":"heartbeat", "status":"idle"}])
-        self.assertEqual(cadence.interval(), 5)
+        self.assertEqual(cadence.interval(), 10)
         thread["messages"].append({"text":"new reply"})
         cadence.observe([thread])
-        self.assertEqual(cadence.interval(), 2)
+        self.assertEqual(cadence.interval(), 1)
         clock[0] += 179
         cadence.observe([thread])
-        self.assertEqual(cadence.interval(), 2)
+        self.assertEqual(cadence.interval(), 1)
         clock[0] += 1
-        self.assertEqual(cadence.interval(), 5)
+        self.assertEqual(cadence.interval(), 10)
         cadence.activate()  # A phone request also starts a fresh window.
         clock[0] += 120
         thread["messages"].append({"text":"another reply"})
         cadence.observe([thread])
         clock[0] += 179
-        self.assertEqual(cadence.interval(), 2)
+        self.assertEqual(cadence.interval(), 1)
         clock[0] += 1
-        self.assertEqual(cadence.interval(), 5)
+        self.assertEqual(cadence.interval(), 10)
         cadence.observe([])  # Pruning history is not an exchange.
-        self.assertEqual(cadence.interval(), 5)
+        self.assertEqual(cadence.interval(), 10)
         chat = {"id":ID,"kind":"chatgpt","messages":[],"loaded":False}
         cadence.observe([chat])
         chat.update(loaded=True,messages=[{"text":"historical ChatGPT message"}])
         cadence.observe([chat])
-        self.assertEqual(cadence.interval(),5)
+        self.assertEqual(cadence.interval(),10)
         chat["messages"].append({"text":"new ChatGPT reply"})
         cadence.observe([chat])
-        self.assertEqual(cadence.interval(),2)
+        self.assertEqual(cadence.interval(),1)
 
     def test_queue_deduplication_and_crash_recovery(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -105,6 +105,15 @@ class ViewerTests(unittest.TestCase):
                 new={"requestId":str(uuid.uuid4()),"text":"新建任务","title":"手机测试","projectId":ID}
                 self.assertEqual(req("POST","/api/threads/new",new,auth)[0],202)
                 self.assertEqual(MessageQueue(data).for_thread("new")[0]["kind"],"create")
+                snapshot['bridge']['prompts'] = [{'id': 'approval-fixture', 'threadId': ID, 'type': 'approval'}]
+                viewer.ingest(data, snapshot)
+                action = {'requestId': str(uuid.uuid4()), 'promptId': 'approval-fixture', 'decision': 'decline'}
+                self.assertEqual(req('POST', f'/api/threads/{ID}/actions', action, base)[0], 401)
+                self.assertEqual(req('POST', f'/api/threads/{ID}/actions', {**action, 'promptId': 'wrong'}, auth)[0], 400)
+                status, result, _ = req('POST', f'/api/threads/{ID}/actions', action, auth)
+                self.assertEqual(status, 202)
+                self.assertEqual(result['kind'], 'decision')
+                self.assertEqual(result['args']['decision'], 'decline')
                 snapshot["bridge"]["connected"]=False
                 snapshot["pollInterval"]=5
                 viewer.ingest(data,snapshot)
@@ -146,7 +155,7 @@ class ViewerTests(unittest.TestCase):
             thread = {"id": ID, "title": "测试", "messages": []}
             viewer.ingest(data, {"order": [ID], "threads": [thread], "syncedAt": "one"})
             viewer.ingest(data, {"order": [ID], "threads": [], "syncedAt": "two"})
-            self.assertEqual(json.loads((data / "snapshot.json").read_bytes())["threads"], [thread])
+            self.assertEqual(json.loads((data / "snapshot.json").read_bytes())["threads"], [{**thread, 'contentSyncedAt': 'one'}])
             viewer.ingest(data, {"order": [], "threads": [], "syncedAt": "three"})
             self.assertEqual(json.loads((data / "snapshot.json").read_bytes())["threads"], [])
             with self.assertRaises(ValueError):

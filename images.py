@@ -111,4 +111,13 @@ def extract_images(text):
         for key in re.findall(r"([0-9a-f]{64}\.(?:jpg|png))", block):
             if key not in images and len(images) < MAX_COUNT:
                 images.append(key)
-    return re.sub(pattern, "", text).strip(), images
+    text = re.sub(pattern, "", text).strip()
+    # Only the exact relay suffix is an attachment envelope; ordinary Markdown stays.
+    suffix = r"\n\n附图（手机上传，请用 view_image 查看后回答）：\n((?:!\[附图 \d+\]\(<[^\n<>]*[\\/]\.state[\\/]incoming[\\/][0-9a-f]{64}\.(?:jpg|png)>\)(?:\n|$))+)\Z"
+    match = re.search(suffix, text)
+    if match:
+        for key in re.findall(r"([0-9a-f]{64}\.(?:jpg|png))", match[1]):
+            if key not in images and len(images) < MAX_COUNT:
+                images.append(key)
+        text = text[:match.start()].strip()
+    return text, images

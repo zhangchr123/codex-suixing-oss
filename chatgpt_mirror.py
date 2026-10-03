@@ -10,7 +10,8 @@ from control import DesktopBridge
 class ChatGPTMirror:
     def __init__(self, root, state_dir=None):
         self.root = Path(root)
-        self.client = DesktopBridge(root, state_dir)
+        self.state_dir = Path(state_dir or os.environ.get("CODEX_SUIXING_STATE_DIR") or self.root / ".state").resolve()
+        self.client = DesktopBridge(root, self.state_dir)
         self.stopped = threading.Event()
         self.lock = threading.Lock()
         self.wake = threading.Event()
@@ -18,18 +19,12 @@ class ChatGPTMirror:
         self.delay = 5
         self.connected = False
         self.threads = []
-        self.cache = self.client.state_dir / "chatgpt-cache.json"
+        self.cache = self.state_dir / "chatgpt-cache.json"
         try:
             self.threads = json.loads(self.cache.read_bytes())
         except (OSError, ValueError):
             pass
-        self.worker = threading.Thread(target=self._run, daemon=True)
-        self.worker.start()
-
-    def close(self):
-        self.stopped.set()
-        self.wake.set()
-        self.worker.join(timeout=46)
+        threading.Thread(target=self._run, daemon=True).start()
 
     def request(self, ids, delay):
         ids = sorted(set(ids))[:3]
@@ -43,6 +38,9 @@ class ChatGPTMirror:
         with self.lock:
             return list(self.threads), self.connected
 
+    def close(self):
+        self.stopped.set(); self.wake.set(); self.client.close()
+
     def _run(self):
         while not self.stopped.is_set():
             try:
@@ -54,7 +52,7 @@ class ChatGPTMirror:
                     if self.connected:
                         previous = {row["id"]: row for row in self.threads}
                         self.threads = [({**row, "messages":previous[row["id"]]["messages"], "loaded":True,
-                                          "truncated":previous[row["id"]].get("truncated",False)}
+                                          "truncated":previous[row["id"]].get("truncated",False),"bodyCheckedAt":previous[row["id"]].get("bodyCheckedAt")}
                                          if not row.get("loaded") and previous.get(row["id"], {}).get("loaded") else row)
                                         for row in result["threads"]]
                 if self.connected:
@@ -74,4 +72,3 @@ class ChatGPTMirror:
                 delay = self.delay
             self.wake.wait(delay)
             self.wake.clear()
-        self.client.close()

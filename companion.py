@@ -15,7 +15,10 @@ LABEL = "org.codexsuixing.companion"
 
 def is_running(state):
     """Probe the actual sync lock, never trust a stale or recycled PID."""
-    path = Path(state) / "sync.lock"
+    return any(lock_running(Path(state) / name) for name in ('sync.lock', 'supervisor.lock'))
+
+
+def lock_running(path):
     if not path.exists():
         return False
     with path.open("r+b") as lock:
@@ -37,19 +40,34 @@ def worker_args(state):
     executable = Path(sys.executable)
     if os.name == "nt" and executable.with_name("pythonw.exe").exists():
         executable = executable.with_name("pythonw.exe")
-    return [str(executable), str(ROOT / "companion.py"), "run", "--state-dir", str(state)]
+    return [str(executable), str(ROOT / "companion.py"), "supervise", "--state-dir", str(state)]
+
+
+def ensure_tray(state):
+    if os.name != 'nt' or os.environ.get('CODEX_SUIXING_NO_TRAY') == '1':
+        return
+    (state / 'tray-stop.flag').unlink(missing_ok=True)
+    shell = Path(os.environ['WINDIR']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
+    subprocess.Popen([str(shell), '-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
+        '-File', str(ROOT / 'sync-tray.ps1'), '-StateDir', str(state)], cwd=ROOT,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW)
 
 
 def start(state):
     read_config(state)
     if is_running(state):
+        ensure_tray(state)
         return "同步已经在运行"
+    (state / 'stop.request').unlink(missing_ok=True)
+    (state / 'sync-stop.flag').unlink(missing_ok=True)
     with (state / "launcher.log").open("ab") as log:
         child = subprocess.Popen(worker_args(state), cwd=ROOT, stdin=subprocess.DEVNULL,
             stdout=log, stderr=log, start_new_session=os.name != "nt",
             creationflags=(subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS) if os.name == "nt" else 0)
     for _ in range(30):
         if is_running(state):
+            ensure_tray(state)
             return "同步已启动"
         if child.poll() is not None:
             raise RuntimeError("启动失败，请查看 launcher.log 和 sync.log")
@@ -61,6 +79,7 @@ def stop(state):
     if not is_running(state):
         return "同步未运行"
     private_write(state / "stop.request", "stop\n")
+    private_write(state / "sync-stop.flag", "stop\n")
     return "已请求停止；正在进行的传输和发送结束后退出"
 
 
@@ -111,6 +130,19 @@ def run(state):
     viewer.main()
 
 
+def supervise(state):
+    config = read_config(state)
+    os.environ.update(bridge_env(state, config))
+    ensure_tray(state)
+    args = ['sync', '--data-dir', str(state), '--log-file', str(state / 'sync.log'),
+        '--codex-home', config['codexHome'], '--ssh-host', config['sshHost'], '--remote-python', config['remotePython']]
+    if config.get('hostname'):args += ['--hostname', config['hostname']]
+    if config.get('control'):args += ['--control']
+    import sync_supervisor
+    sys.argv = [str(ROOT / 'sync_supervisor.py'), *args]
+    sync_supervisor.main()
+
+
 def doctor(state, desktop=False):
     config = read_config(state)
     checks = {"python": sys.version.split()[0], "ssh": bool(shutil.which("ssh")),
@@ -131,7 +163,7 @@ def doctor(state, desktop=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["init", "run", "start", "stop", "status", "doctor", "autostart"])
+    parser.add_argument("command", choices=["init", "run", "supervise", "start", "stop", "status", "doctor", "autostart"])
     parser.add_argument("--state-dir")
     parser.add_argument("--ssh-host")
     parser.add_argument("--url")
@@ -151,6 +183,8 @@ def main():
             print("配置已保存：", state / "connection.json")
         elif args.command == "run":
             run(state)
+        elif args.command == "supervise":
+            supervise(state)
         elif args.command == "start":
             print(start(state))
         elif args.command == "stop":

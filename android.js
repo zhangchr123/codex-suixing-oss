@@ -29,7 +29,7 @@ $('pair').onclick=async()=>{
   try{
     const result=await request('/api/android/pair',{challenge});
     // The code is bound to a verifier held only by the initiating installation.
-    const target='intent://activate?code='+encodeURIComponent(result.code)+'#Intent;scheme=codexsuixing;package=org.codexsuixing.app;end';
+    const target='intent://activate?code='+encodeURIComponent(result.code)+'#Intent;scheme=codexsuixing;package=cn.coimgrain.codexsuixing;end';
     $('activate').href=target;$('activate').hidden=false;$('message').textContent='授权已准备好，点“返回 App 完成绑定”。';
   }catch(e){$('message').textContent=e.message;$('pair').disabled=false}
 };

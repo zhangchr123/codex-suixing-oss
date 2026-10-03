@@ -8,6 +8,7 @@ import hmac
 import http.cookies
 import http.server
 import json
+import signal
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -17,9 +18,9 @@ import secrets
 import shlex
 import socket
 import ssl
+import sqlite3
 import subprocess
 import sys
-import signal
 import tempfile
 import threading
 import time
@@ -28,14 +29,41 @@ from control import DesktopBridge, MessageQueue
 from android_auth import AndroidDevices
 from chatgpt_mirror import ChatGPTMirror
 from images import ImageStore, extract_images
+from media import MediaStore, MediaMirror
+from relay import SSHRelay, read_frame, write_frame
 
 ROOT = Path(__file__).resolve().parent
+# The deployed host also provides the existing novel-workbench extension.
+novel_proxy = None
+if (ROOT / 'novel_proxy.py').is_file():
+    import novel_proxy
 ID_RE = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 ID_IN_NAME = re.compile(r"([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\.jsonl$")
 TAIL_BYTES = 16 * 1024 * 1024
 MAX_MESSAGES = 300
 MAX_TEXT = 32000
 MAX_THREAD_CHARS = 250000
+
+
+class SnapshotCache:
+    """Share the last parsed atomic snapshot across HTTP readers."""
+    def __init__(self, file):
+        self.file = Path(file)
+        self.lock = threading.Lock()
+        self.signature = None
+        self.value = {"syncedAt": None, "threads": [], "bridge": {"connected": False}}
+
+    def read(self):
+        with self.lock:
+            try:
+                stat = self.file.stat()
+                signature = (stat.st_mtime_ns, stat.st_size)
+                if signature != self.signature:
+                    self.value = json.loads(self.file.read_bytes())
+                    self.signature = signature
+            except (OSError, ValueError):
+                pass
+            return self.value
 
 
 def now():
@@ -59,10 +87,17 @@ def atomic_write(file, value):
 
 
 def clean_user(text):
+    if text.lstrip().startswith('# Files mentioned by the user:'):
+        request = re.search(r'^#{1,6} My request:\s*\n', text, re.MULTILINE)
+        if request:
+            text = text[request.end():]
     # Desktop inserts these context envelopes as user-role messages.
     for tag in ("recommended_plugins", "environment_context", "permissions instructions",
-                "app-context", "skills_instructions", "turn_aborted"):
-        text = re.sub(r"<" + re.escape(tag) + r">[\s\S]*?</" + re.escape(tag) + r">", "", text)
+                "app-context", "skills_instructions", "turn_aborted", "external_codex_apps_open_page", "codex_suixing_message_id",
+                "codex_internal_context", "heartbeat", "in-app-browser-context", "collaboration_mode", "subagent_notification"):
+        text = re.sub(r"<" + re.escape(tag) + r"(?:\s[^>]*)?>[\s\S]*?</" + re.escape(tag) + r">", "", text)
+    text = re.sub(r'</?image\b[^>]*>', '', text)
+    text = re.sub(r'^\s*#{1,6} My request:\s*', '', text)
     if text.lstrip().startswith(("# AGENTS.md instructions", "<collaboration_mode>", "<subagent_notification>")):
         return ""
     if "<send_user_message_question_reply>" in text:
@@ -74,9 +109,15 @@ def clean_user(text):
     return text.strip()
 
 
+def clean_assistant(text):
+    # App renders this trailing metadata separately; it is not reply prose.
+    return re.sub(r'\s*<oai-mem-citation>[\s\S]*?</oai-mem-citation>\s*$', '', text).strip()
+
+
 class Transcript:
-    def __init__(self, file):
+    def __init__(self, file, media=None):
         self.file = file
+        self.media = media
         self.id = ID_IN_NAME.search(file.name).group(1)
         self.offset = 0
         self.pending = b""
@@ -94,7 +135,7 @@ class Transcript:
         if signature == self.signature:
             return
         if stat.st_size < self.offset:
-            self.__init__(self.file)
+            self.__init__(self.file, self.media)
         with self.file.open("rb") as stream:
             if self.signature is None:
                 first = stream.readline(2 * 1024 * 1024)
@@ -149,7 +190,7 @@ class Transcript:
                 role = "user" if event == "user_message" else "assistant"
                 text = p.get("message", "")
                 if isinstance(text, str):
-                    text = clean_user(text) if role == "user" else text.strip()
+                    text = clean_user(text) if role == "user" else clean_assistant(text)
                     if text:
                         self.fallback.append({"role": role, "phase": "", "text": text[:MAX_TEXT], "time": row.get("timestamp", "")})
             return
@@ -165,16 +206,25 @@ class Transcript:
             if item.get("type") in ("input_text", "output_text"):
                 parts.append(item.get("text", ""))
             elif item.get("type") in ("input_image", "image", "input_audio", "input_file"):
-                parts.append("[附件：请在电脑上的 Codex 查看]")
+                key = None
+                if self.media and item.get('type') in ('input_image', 'image'):
+                    try:
+                        key = self.media.inline_image(item.get('image_url', ''))
+                    except Exception:
+                        pass
+                parts.append('![附件图片](/api/media/' + key + ')' if key else "[附件：请在电脑上的 Codex 查看]")
         text = "\n".join(parts)
+        marker = re.search(r'<codex_suixing_message_id>([0-9a-f-]{36})</codex_suixing_message_id>', text)
         if role == "user":
             text = clean_user(text)
+        else:
+            text = clean_assistant(text)
         if not text.strip():
             return
         if len(text) > MAX_TEXT:
             text = text[:MAX_TEXT] + "\n[本条消息过长，完整内容请在电脑查看]"
         text, images = extract_images(text) if role == "user" else (text, [])
-        self.messages.append({"role": role, "phase": phase, "text": text.strip(), "time": row.get("timestamp", ""), **({"images":images} if images else {})})
+        self.messages.append({"role": role, "phase": phase, "text": text.strip(), "time": row.get("timestamp", ""), **({"nativeItemId":p['id']} if p.get('id') else {}), **({"images":images} if images else {}), **({"requestId":marker[1]} if marker else {})})
         if role == "assistant" and phase == "final":
             self.status = "idle"
 
@@ -192,8 +242,9 @@ class Transcript:
 
 
 class Exporter:
-    def __init__(self, codex_home, limit=30):
+    def __init__(self, codex_home, limit=30, media=None):
         self.home = codex_home
+        self.media = media
         self.limit = limit
         self.cache = {}
 
@@ -210,6 +261,16 @@ class Exporter:
                         pass
         except FileNotFoundError:
             pass
+        try:
+            database = self.home / 'state_5.sqlite'
+            with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=1) as db:
+                for key, name, title in db.execute('SELECT id,name,title FROM threads WHERE archived=0 ORDER BY updated_at DESC LIMIT 100'):
+                    if name:
+                        titles[key] = name
+                    elif title:
+                        titles.setdefault(key, title)
+        except (OSError, ValueError, sqlite3.Error):
+            pass
         files = []
         for file in (self.home / "sessions").rglob("*.jsonl"):
             if ID_IN_NAME.search(file.name):
@@ -222,7 +283,7 @@ class Exporter:
         active = set()
         for file, stat in files:
             active.add(file)
-            transcript = self.cache.setdefault(file, Transcript(file))
+            transcript = self.cache.setdefault(file, Transcript(file, self.media))
             try:
                 transcript.read(stat)
             except (OSError, PermissionError):
@@ -237,6 +298,8 @@ class Exporter:
 
 
 def ingest(data_dir, batch):
+    if batch.get('media'):
+        MediaStore(Path(data_dir) / 'media').accept(batch['media'])
     order = batch.get("order", [])
     if len(order) > 100 or any(not ID_RE.fullmatch(item) for item in order):
         raise ValueError("Invalid thread IDs")
@@ -250,14 +313,16 @@ def ingest(data_dir, batch):
     for row in batch.get("threads", []):
         if not ID_RE.fullmatch(row["id"]):
             raise ValueError("Invalid thread ID")
-        by_id[row["id"]] = row
-    snapshot = {"syncedAt": batch["syncedAt"], "bridge": batch.get("bridge", {"connected": False}), "pollInterval": batch.get("pollInterval", 5), "threads": [by_id[i] for i in order if i in by_id]}
+        prior = by_id.get(row['id'], {})
+        checked = prior.get('contentSyncedAt') if prior.get('messages') == row.get('messages') else batch['syncedAt']
+        by_id[row["id"]] = {**row, 'contentSyncedAt': checked or batch['syncedAt']}
+    snapshot = {"syncedAt": batch["syncedAt"], "bridge": batch.get("bridge", {"connected": False}), "cloud": batch.get("cloud", {}), "pollInterval": batch.get("pollInterval", 5), "threads": [by_id[i] for i in order if i in by_id]}
     atomic_write(file, encoded(snapshot))
 
 
 class SyncCadence:
     """Keep a sliding activity window; heartbeats and old history do not renew it."""
-    def __init__(self, idle_interval=5, active_interval=2, active_window=180, clock=time.monotonic):
+    def __init__(self, idle_interval=10, active_interval=1, active_window=180, clock=time.monotonic):
         self.idle_interval = idle_interval
         self.active_interval = active_interval
         self.active_window = active_window
@@ -279,16 +344,53 @@ class SyncCadence:
     def interval(self):
         return self.active_interval if self.clock() < self.active_until else self.idle_interval
 
+    def wait(self, started):
+        # Cadence measures complete rounds, rather than adding a full delay to I/O.
+        return max(0.1, self.interval() - (self.clock() - started))
+
+
+def exchange_batch(data, batch):
+    ingest(data, batch)
+    jobs = MessageQueue(data).exchange(batch.get('receipts', []), batch.get('bridge', {}).get('connected', False))
+    for job in jobs:
+        try:
+            job['imageData'] = ImageStore(data / 'uploads').transport(job.get('args', {}).get('images', []))
+        except (OSError, ValueError):
+            job['imageData'] = []
+    try:
+        views = json.loads((data / 'chat-views.json').read_bytes())
+        requested = [key for key, stamp in sorted(views.items(), key=lambda row: row[1], reverse=True)
+                     if ID_RE.fullmatch(key) and time.time() - stamp < 60][:3]
+    except (OSError, ValueError, TypeError):
+        requested = []
+    try:
+        foreground = time.time() - float((data / 'foreground.txt').read_text()) < 25
+    except (OSError, ValueError):
+        foreground = False
+    return {'jobs': jobs, 'chatRequests': requested, 'foreground': foreground}
+
 
 def sync(args):
-    exporter = Exporter(Path(args.codex_home).expanduser(), args.limit)
+    media = MediaMirror(ROOT, args.codex_home, args.data_dir)
+    exporter = Exporter(Path(args.codex_home).expanduser(), args.limit, media)
     sent = {}
     last_heartbeat = 0
     bridge = DesktopBridge(ROOT, args.data_dir) if args.ssh_host and args.control else None
     chats = ChatGPTMirror(ROOT, args.data_dir) if bridge else None
+    from cloud_mirror import CloudMirror
+    cloud = CloudMirror(ROOT, args.data_dir) if bridge else None
+    sent_media = set()
     cadence = SyncCadence(idle_interval=args.interval)
     previous_interval = None
     published_interval = None
+    relay = None
+    if args.ssh_host:
+        command = ['ssh', '-o', 'StrictHostKeyChecking=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=20', '-o', 'ServerAliveCountMax=2']
+        if args.hostname:
+            command += ['-o', 'HostName=' + args.hostname]
+        command += [args.ssh_host, f'{shlex.quote(args.remote_python)} ~/.local/share/codex-viewer/viewer.py exchange-stream']
+        relay = SSHRelay(command)
+    failures = 0
     stopped = threading.Event()
     stop_file = Path(args.data_dir) / "stop.request"
     if threading.current_thread() is threading.main_thread():
@@ -296,62 +398,82 @@ def sync(args):
         signal.signal(signal.SIGINT, lambda *_: stopped.set())
     try:
         while not stopped.is_set() and not stop_file.exists():
+            started = time.monotonic()
             try:
                 threads = exporter.snapshot()
+                try:
+                    live = json.loads((Path(args.data_dir) / 'native-live.json').read_bytes())
+                    for thread in threads:
+                        canonical = {m.get('nativeItemId') for m in thread['messages']}
+                        extra = [m for m in live.get(thread['id'], []) if m['nativeItemId'] not in canonical]
+                        if extra:
+                            thread['messages'] = thread['messages'] + extra
+                            thread['status'] = 'running'
+                except (OSError, ValueError, KeyError, TypeError):
+                    pass
                 local_ids = [t["id"] for t in threads]
                 chat_threads, chat_connected = chats.snapshot() if chats else ([], False)
                 threads += chat_threads
+                cloud_threads, cloud_status = cloud.snapshot() if cloud else ([], {})
+                threads += cloud_threads
+                threads, needed_media = media.rewrite(threads)
+                image_batch = media.transport(needed_media, sent_media)
                 cadence.observe(threads)
                 hashes = {t["id"]: hashlib.sha256(encoded(t)).hexdigest() for t in threads}
                 changed = [t for t in threads if sent.get(t["id"]) != hashes[t["id"]]]
                 if bridge or changed or hashes != sent or cadence.interval() != published_interval or time.monotonic() - last_heartbeat > 30 or args.once:
-                    batch = {"threads": changed, "order": [t["id"] for t in threads], "syncedAt": now(), "pollInterval": cadence.interval()}
+                    batch = {"threads": changed, "order": [t["id"] for t in threads], "syncedAt": now(), "pollInterval": cadence.interval(), "media": image_batch, "cloud": cloud_status}
                     if bridge:
                         batch["bridge"] = {**bridge.status(local_ids),"chatgptConnected":chat_connected,"chatgptThreadIds":[t["id"] for t in chat_threads]}
                         batch["receipts"] = list(bridge.receipts.values())
                     if args.ssh_host:
-                        command = ["ssh", "-o", "StrictHostKeyChecking=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=2"]
-                        if args.hostname:
-                            command.extend(["-o", "HostName=" + args.hostname])
-                        mode = "exchange" if bridge else "ingest"
-                        command.extend([args.ssh_host, f"{shlex.quote(args.remote_python)} ~/.local/share/codex-viewer/viewer.py {mode} --gzip"])
-                        result = subprocess.run(command, input=gzip.compress(encoded(batch)), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45,
-                                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-                        if result.returncode:
-                            raise RuntimeError(result.stderr.decode("utf-8", "replace").strip())
+                        response = relay.exchange(batch)
+                        atomic_write(Path(args.data_dir) / 'sync-health.json', encoded({'lastSuccess': now(),
+                            'connected': bool(batch.get('bridge', {}).get('connected')), 'pollInterval': cadence.interval(), 'error': ''}))
                         if bridge:
-                            response = json.loads(result.stdout)
                             jobs = response.get("jobs", [])
-                            if jobs:
+                            if jobs or response.get('foreground'):
                                 cadence.activate()
                             bridge.deliver(jobs, atomic_write)
                             chats.request(response.get("chatRequests", []), cadence.interval())
                     else:
                         ingest(Path(args.data_dir), batch)
                     sent = hashes
+                    sent_media.update(row['id'] for row in image_batch)
                     published_interval = batch["pollInterval"]
                     last_heartbeat = time.monotonic()
+                    failures = 0
                     if changed or args.once:
                         logging.info("synced %d changed / %d conversations", len(changed), len(threads))
             except Exception as error:
+                failures += 1
                 logging.error("sync failed: %s", error)
+                if args.ssh_host:
+                    try:
+                        health_file = Path(args.data_dir) / 'sync-health.json'
+                        health = json.loads(health_file.read_bytes()) if health_file.exists() else {}
+                        atomic_write(health_file, encoded({**health, 'error': '同步连接失败，正在重试', 'failedAt': now()}))
+                    except (OSError, ValueError):
+                        pass
                 if args.once:
                     raise
             if args.once:
+                if relay:
+                    relay.close()
                 return
             interval = cadence.interval()
             if interval != previous_interval:
                 logging.info("sync cadence: %s seconds (%s)", interval, "active" if interval < args.interval else "idle")
                 previous_interval = interval
-            for _ in range(max(1, int(interval * 5))):
-                if stopped.wait(0.2) or stop_file.exists():
-                    break
-    finally:
-        if bridge:
-            bridge.close()
-        if chats:
-            chats.close()
+            delay = max(cadence.wait(started), min(60, 5 * 2 ** min(failures - 1, 4))) if failures else cadence.wait(started)
+            deadline = time.monotonic() + delay
+            while time.monotonic() < deadline and not stop_file.exists():
+                if stopped.wait(min(0.2, max(0, deadline - time.monotonic()))): break
 
+    finally:
+        if relay: relay.close()
+        if bridge: bridge.close()
+        if chats: chats.close()
 
 
 def make_server(host, port, data_dir, password, tls=False):
@@ -362,8 +484,12 @@ def make_server(host, port, data_dir, password, tls=False):
     images = ImageStore(data_dir / "uploads")
     chat_views = {}
     chat_views_lock = threading.Lock()
+    snapshot_cache = SnapshotCache(data_dir / 'snapshot.json')
+    foreground_lock = threading.Lock()
+    foreground_at = [0]
 
     class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
         def setup(self):
             super().setup()
             self.connection.settimeout(15)
@@ -372,14 +498,33 @@ def make_server(host, port, data_dir, password, tls=False):
             pass  # Do not log credentials or conversation URLs.
 
         def reply(self, status, value, mime="application/json; charset=utf-8", cookie=None, filename=None):
+            # Rejected POSTs may still have unread bodies. They cannot share the
+            # next HTTP/1.1 request, so close only those error connections.
+            if self.command == 'POST' and status >= 400:
+                self.close_connection = True
             body = value if isinstance(value, bytes) else encoded(value)
+            cached = self.command == 'GET' and status == 200 and (self.path.startswith(('/api/', '/vendor/')) or self.path in ('/style.css', '/app.js', '/android.js', '/polling.js', '/timeline.js', '/math.js', '/formatting.js'))
+            etag = 'W/"' + hashlib.sha256(body).hexdigest() + '"' if cached else None
+            if cached and self.headers.get('If-None-Match') == etag:
+                status, body = 304, b''
+            compressed = status == 200 and len(body) > 1024 and 'gzip' in self.headers.get('Accept-Encoding', '') and (mime.startswith(('application/json', 'application/javascript', 'text/')))
+            if compressed:
+                body = gzip.compress(body, compresslevel=5, mtime=0)
             self.send_response(status)
             self.send_header("Content-Type", mime)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            if self.close_connection:
+                self.send_header('Connection', 'close')
+            image_cache = cached and self.path.startswith(('/api/media/', '/api/images/'))
+            self.send_header("Cache-Control", "private, max-age=31536000, immutable" if image_cache else "private, no-cache" if cached else "no-store")
+            if etag:
+                self.send_header('ETag', etag)
+            if compressed:
+                self.send_header('Content-Encoding', 'gzip')
+            self.send_header('Vary', 'Accept-Encoding')
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
-            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
             if cookie:
                 self.send_header("Set-Cookie", cookie)
             if filename:
@@ -414,10 +559,7 @@ def make_server(host, port, data_dir, password, tls=False):
             return hmac.new(session_key, ("csrf:" + value).encode(), hashlib.sha256).hexdigest()
 
         def snapshot(self):
-            try:
-                return json.loads((data_dir / "snapshot.json").read_bytes())
-            except FileNotFoundError:
-                return {"syncedAt": None, "threads": [], "bridge": {"connected": False}}
+            return snapshot_cache.read()
 
         def migration_target(self):
             try:
@@ -427,22 +569,43 @@ def make_server(host, port, data_dir, password, tls=False):
                 return ""
 
         def do_GET(self):
+            if novel_proxy and novel_proxy.route(self):
+                return
             path = urlsplit(self.path).path
+            if path == '/favicon.ico':
+                return self.reply(204, b'')
             if path == "/":
                 return self.reply(200, (ROOT / "index.html").read_bytes(), "text/html; charset=utf-8")
             if path == "/health":
                 return self.reply(200, {"ok": True, "migrationTarget": self.migration_target()})
             if path == "/android":
                 return self.reply(200, (ROOT / "android.html").read_bytes(), "text/html; charset=utf-8")
+            if path == '/style.css':
+                return self.reply(200, (ROOT / 'style.css').read_bytes(), 'text/css; charset=utf-8')
+            if path.startswith('/vendor/katex/'):
+                name = path.removeprefix('/vendor/katex/')
+                valid = name in ('katex.min.js', 'katex.min.css') or re.fullmatch(r'fonts/[A-Za-z0-9_-]+\.woff2', name)
+                if valid:
+                    file = ROOT / 'vendor/katex' / name
+                    if file.is_file():
+                        mime = 'text/css' if name.endswith('.css') else 'font/woff2' if name.endswith('.woff2') else 'application/javascript'
+                        return self.reply(200, file.read_bytes(), mime)
+                return self.reply(404, {'error': '资源不存在'})
             if path == "/downloads/codex-suixing.apk":
                 apk = ROOT / "downloads" / "codex-suixing.apk"
                 if apk.is_file():
                     return self.reply(200, apk.read_bytes(), "application/vnd.android.package-archive", filename="codex-suixing.apk")
                 return self.reply(404, {"error": "安装包尚未发布"})
-            if path in ("/vendor/markdown-it.min.js", "/app.js", "/android.js", "/polling.js"):
+            if path in ("/vendor/markdown-it.min.js", "/app.js", "/android.js", "/polling.js", "/timeline.js", "/math.js", '/formatting.js'):
                 return self.reply(200, (ROOT / path.lstrip("/")).read_bytes(), "application/javascript; charset=utf-8")
             if not self.authorized():
                 return self.reply(401, {"error": "请先输入访问密码"})
+            if path.startswith('/api/media/'):
+                try:
+                    content, mime = MediaStore(data_dir / 'media').read(path.removeprefix('/api/media/'))
+                    return self.reply(200, content, mime)
+                except (OSError, ValueError):
+                    return self.reply(404, {'error': '图片暂不可预览'})
             if path.startswith("/api/images/"):
                 try:
                     content, mime = images.read(path.removeprefix("/api/images/"))
@@ -453,9 +616,14 @@ def make_server(host, port, data_dir, password, tls=False):
                 return self.reply(200, {"devices": devices.list(), "csrfToken": self.csrf()})
             snapshot = self.snapshot()
             if self.migration_target():
-                snapshot["bridge"] = {"connected": False}
+                snapshot = {**snapshot, 'bridge': {'connected': False}}
             if path == "/api/threads":
-                return self.reply(200, {"syncedAt": snapshot["syncedAt"], "bridge": snapshot.get("bridge", {}), "pollInterval": snapshot.get("pollInterval", 5), "csrfToken": self.csrf(), "creations": messages.for_thread("new"), "threads": [{k: v for k, v in t.items() if k != "messages"} for t in snapshot["threads"]]})
+                with foreground_lock:
+                    if time.time() - foreground_at[0] >= 5:
+                        foreground_at[0] = time.time()
+                        atomic_write(data_dir / 'foreground.txt', str(foreground_at[0]).encode())
+                listings = [{**{k: v for k, v in t.items() if k != 'messages'}, 'previewText': (t.get('messages', [{}])[-1].get('text', '') if t.get('messages') else '').replace('\n', ' ')[:100]} for t in snapshot['threads']]
+                return self.reply(200, {"syncedAt": snapshot["syncedAt"], "bridge": snapshot.get("bridge", {}), "cloud": snapshot.get("cloud", {}), "pollInterval": snapshot.get("pollInterval", 5), "csrfToken": self.csrf(), "creations": messages.for_thread("new"), "threads": listings})
             match = re.fullmatch(r"/api/threads/([0-9a-f-]+)", path)
             if match and ID_RE.fullmatch(match[1]):
                 row = next((t for t in snapshot["threads"] if t["id"] == match[1]), None)
@@ -469,8 +637,11 @@ def make_server(host, port, data_dir, password, tls=False):
             self.reply(404, {"error": "未找到内容"})
 
         def do_POST(self):
+            if novel_proxy and novel_proxy.route(self):
+                return
             path = urlsplit(self.path).path
-            match = re.fullmatch(r"/api/threads/([0-9a-f-]+)/messages", path)
+            match = re.fullmatch(r"/api/threads/([0-9a-f-]+)/(messages|actions)", path)
+            decision = bool(match and match[2] == 'actions')
             create = path == "/api/threads/new"
             android = path in ("/api/android/pair", "/api/android/activate", "/api/android/session", "/api/android/revoke")
             if path != "/login" and not match and not create and not android:
@@ -523,7 +694,7 @@ def make_server(host, port, data_dir, password, tls=False):
                     body = json.loads(self.rfile.read(length))
                     if not isinstance(body, dict):
                         raise ValueError("无效消息")
-                    text = body.get("text")
+                    text = '处理请求' if decision else body.get("text")
                     image_rows = body.get("images", [])
                     request_id = body.get("requestId", "")
                     if not isinstance(text, str) or (not text.strip() and not image_rows) or len(text) > 8000 or not isinstance(request_id, str) or not ID_RE.fullmatch(request_id):
@@ -534,6 +705,32 @@ def make_server(host, port, data_dir, password, tls=False):
                     age = time.time() - dt.datetime.fromisoformat(snapshot["syncedAt"].replace("Z", "+00:00")).timestamp()
                     if age > 60 or not bridge.get("connected"):
                         return self.reply(409, {"error": "电脑暂未连接，请打开电脑上的 Codex 和同步程序后再发"})
+                    if decision:
+                        prompt = next((p for p in bridge.get('prompts', []) if p['id'] == body.get('promptId') and p['threadId'] == match[1]), None)
+                        if not prompt or match[1] not in bridge.get('threadIds', []):
+                            raise ValueError('请求已结束，请刷新后查看')
+                        args = {'promptId': prompt['id']}
+                        if prompt['type'] == 'approval':
+                            if body.get('decision') not in ('accept', 'decline'):
+                                raise ValueError('请选择允许或拒绝')
+                            args['decision'] = body['decision']
+                        else:
+                            answers = body.get('answers')
+                            expected = {q['id'] for q in prompt.get('questions', [])}
+                            if not isinstance(answers, dict) or set(answers) != expected or any(not isinstance(v, str) or not v.strip() or len(v) > 2000 for v in answers.values()):
+                                raise ValueError('请回答所有问题')
+                            args['answers'] = answers
+                        return self.reply(202, messages.enqueue(request_id, match[1], text, 'decision', args))
+                    settings = {}
+                    if "model" in body or "thinking" in body:
+                        option = next((m for m in bridge.get("models", []) if m["id"] == body.get("model")), None)
+                        if not option:
+                            raise ValueError("所选模型当前不可用，请重新选择")
+                        settings["model"] = option["id"]
+                        if "thinking" in body:
+                            if body["thinking"] not in option["efforts"]:
+                                raise ValueError("所选模型不支持这个思考强度")
+                            settings["thinking"] = body["thinking"]
                     if create:
                         project_id = body.get("projectId", "")
                         title = body.get("title", "")
@@ -542,7 +739,7 @@ def make_server(host, port, data_dir, password, tls=False):
                         if not isinstance(title, str) or len(title) > 100:
                             raise ValueError("标题不能超过 100 字")
                         refs = images.accept(image_rows) if image_rows else []
-                        return self.reply(202, messages.enqueue(request_id, "new", text, "create", {"projectId":project_id,"title":title.strip(), **({"images":refs} if refs else {})}))
+                        return self.reply(202, messages.enqueue(request_id, "new", text, "create", {"projectId":project_id,"title":title.strip(), **settings, **({"images":refs} if refs else {})}))
                     target=next((t for t in snapshot["threads"] if t["id"]==match[1]),None)
                     chat=bool(target and target.get("kind")=="chatgpt")
                     allowed=bridge.get("chatgptThreadIds" if chat else "threadIds", [])
@@ -550,8 +747,10 @@ def make_server(host, port, data_dir, password, tls=False):
                         return self.reply(409, {"error": "请先在电脑 Codex 中打开这个对话"})
                     if chat and image_rows:
                         raise ValueError("桌面 ChatGPT 目前只能从手机传入文字，图片请在电脑添加")
+                    if chat and settings:
+                        raise ValueError("ChatGPT 聊天的模型请在电脑端选择")
                     refs = images.accept(image_rows) if image_rows else []
-                    return self.reply(202, messages.enqueue(request_id, match[1], text, args={"channel":"chatgpt" if chat else "codex", **({"images":refs} if refs else {})}))
+                    return self.reply(202, messages.enqueue(request_id, match[1], text, args={"channel":"chatgpt" if chat else "codex", **settings, **({"images":refs} if refs else {})}))
                 except (ValueError, TypeError, AttributeError, KeyError) as error:
                     return self.reply(400, {"error": str(error) or "无效消息"})
             address = self.client_address[0]
@@ -629,9 +828,9 @@ def configure_tls(server, certificate, key):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("init", "serve", "sync", "ingest", "exchange"))
+    parser.add_argument("mode", choices=("init", "serve", "sync", "ingest", "exchange", "exchange-stream"))
     parser.add_argument("--data-dir", default=str(ROOT / ".state"))
-    parser.add_argument("--codex-home", default=os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    parser.add_argument("--codex-home", default=str(Path.home() / ".codex"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--cert")
@@ -640,7 +839,7 @@ def main():
     parser.add_argument("--hostname")
     parser.add_argument("--remote-python", default="python3", help="Python executable on the synchronization server")
     parser.add_argument("--limit", type=int, default=30)
-    parser.add_argument("--interval", type=float, default=5, help="Idle delay; message activity uses 2 seconds for 3 minutes")
+    parser.add_argument("--interval", type=float, default=10, help="Idle round interval; foreground/activity uses 1 second for 3 minutes")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--gzip", action="store_true")
     parser.add_argument("--log-file")
@@ -653,28 +852,22 @@ def main():
         if not (data / "password.txt").exists():
             atomic_write(data / "password.txt", secrets.token_urlsafe(18).encode())
         print("Password stored in", data / "password.txt")
+    elif args.mode == 'exchange-stream':
+        while (frame := read_frame(sys.stdin.buffer)) is not None:
+            batch = json.loads(gzip.decompress(frame))
+            write_frame(sys.stdout.buffer, gzip.compress(encoded(exchange_batch(data, batch))))
     elif args.mode in ("ingest", "exchange"):
         raw = sys.stdin.buffer.read(32 * 1024 * 1024 + 1)
         if len(raw) > 32 * 1024 * 1024:
             raise ValueError("Batch too large")
         batch = json.loads(gzip.decompress(raw) if args.gzip else raw)
-        ingest(data, batch)
-        if args.mode == "exchange":
-            jobs = MessageQueue(data).exchange(batch.get("receipts", []), batch.get("bridge", {}).get("connected", False))
-            for job in jobs:
-                try:
-                    job["imageData"] = ImageStore(data / "uploads").transport(job.get("args", {}).get("images", []))
-                except (OSError, ValueError):
-                    job["imageData"] = []  # Desktop fails this job before sending, never silently loses an attachment.
-            try:
-                views=json.loads((data/"chat-views.json").read_bytes())
-                requested=[key for key,stamp in sorted(views.items(),key=lambda row:row[1],reverse=True) if ID_RE.fullmatch(key) and time.time()-stamp<60][:3]
-            except (OSError,ValueError,TypeError):
-                requested=[]
-            sys.stdout.buffer.write(encoded({"jobs": jobs,"chatRequests":requested}))
+        if args.mode == 'exchange':
+            sys.stdout.buffer.write(encoded(exchange_batch(data, batch)))
+        else:
+            ingest(data, batch)
     elif args.mode == "sync":
-        if not 1 <= args.limit <= 100 or args.interval < 2:
-            parser.error("limit must be 1..100; interval must be at least 2 seconds")
+        if not 1 <= args.limit <= 100 or args.interval < 1:
+            parser.error("limit must be 1..100; interval must be at least 1 second")
         if not args.once:
             data.mkdir(parents=True, exist_ok=True)
             lock = (data / "sync.lock").open("a+b")
@@ -711,6 +904,8 @@ def main():
         if tls:
             configure_tls(server, args.cert, args.key)
         print(f"Viewer listening on {args.host}:{args.port}", flush=True)
+        if novel_proxy:
+            novel_proxy.start()
         server.serve_forever()
 
 

@@ -1,4 +1,4 @@
-"""Durable relay queue and a local-only Codex desktop adapter."""
+"""Durable message queue on the relay server; narrow desktop delivery on Windows."""
 import json
 import os
 from pathlib import Path
@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 from images import ImageStore
+from native_client import NativeClient
 from contextlib import contextmanager
 
 
@@ -61,7 +62,7 @@ class MessageQueue:
 
     def for_thread(self, thread_id):
         with self.connect() as db:
-            rows = db.execute("SELECT * FROM messages WHERE thread_id=? ORDER BY created DESC LIMIT 8", (thread_id,)).fetchall()
+            rows = db.execute("SELECT * FROM messages WHERE thread_id=? OR result_thread=? ORDER BY created DESC LIMIT 300", (thread_id, thread_id)).fetchall()
         return [self.public(row) for row in reversed(rows)]
 
     def exchange(self, receipts, ready):
@@ -85,6 +86,7 @@ class DesktopBridge:
     def __init__(self, root, state_dir=None):
         self.root = Path(root)
         self.state_dir = Path(state_dir or os.environ.get("CODEX_SUIXING_STATE_DIR") or self.root / ".state").resolve()
+        self.native = NativeClient(root, self.state_dir)
         self.process = None
         self.responses = queue.Queue()
         self.last_status = 0
@@ -105,6 +107,8 @@ class DesktopBridge:
         responses.put({"connected": False, "status": "uncertain", "detail": "桌面连接中断，未自动重发"})
 
     def call(self, request):
+        if request.get('mode') in ('send', 'create', 'decision') and request.get('channel') != 'chatgpt':
+            return self.native.call(request)
         if self.process is None or self.process.poll() is not None:
             node = os.environ.get("CODEX_SUIXING_NODE") or shutil.which("node")
             if not node:
@@ -132,11 +136,25 @@ class DesktopBridge:
             self.last_status = 0
         if time.monotonic() - self.last_status > 15:
             try:
-                self.live = self.call({"mode": "status", "threadIds": self.known_thread_ids})
+                try:
+                    desktop = self.call({"mode": "status", "threadIds": self.known_thread_ids})
+                except Exception:
+                    desktop = {}
+                request = {'mode': 'status', 'threadIds': self.known_thread_ids}
+                if desktop.get('connected'):
+                    request['projects'] = self.call({'mode': 'project_snapshot'}).get('projects', [])
+                self.live = self.native.call(request)
             except Exception:
-                self.live = {"connected": False, "threadIds": [], "error": "请在电脑上打开 Codex"}
+                self.live = {"connected": False, "threadIds": [], "error": "请检查本机 Codex CLI 登录和同步程序"}
             self.last_status = time.monotonic()
         return self.live
+
+    def close(self):
+        if self.process is not None:
+            if self.process.poll() is None:
+                self.process.terminate(); self.process.wait(timeout=5)
+            self.process.stdin.close(); self.process.stdout.close()
+            self.process = None
 
     def deliver(self, jobs, write):
         for job in jobs:
@@ -165,24 +183,9 @@ class DesktopBridge:
                 write(self.receipts_file, json.dumps(self.receipts, ensure_ascii=False).encode())
                 continue
             try:
-                result = self.call({"mode": "create" if job.get("kind") == "create" else "send", "id": key, "threadId": job["threadId"], "text": job["text"], **arguments})
+                result = self.call({"mode": "create" if job.get("kind") == "create" else "decision" if job.get('kind') == 'decision' else "send", "id": key, "threadId": job["threadId"], "text": job["text"], **arguments})
                 if result.get("status") in ("sent", "failed", "uncertain"):
                     self.receipts[key] = {"id": key, "status": result["status"], "detail": result.get("detail", ""), "resultThreadId": result.get("resultThreadId", "")}
             except Exception:
                 pass
             write(self.receipts_file, json.dumps(self.receipts, ensure_ascii=False).encode())
-
-    def close(self):
-        process = self.process
-        if process is not None:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=3)
-            for stream in (process.stdin, process.stdout):
-                if stream:
-                    stream.close()
-            self.process = None

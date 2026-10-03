@@ -14,6 +14,19 @@ from settings import ROOT, bridge_env, default_state, read_config, save_config, 
 
 
 class CompanionTests(unittest.TestCase):
+    def test_supervisor_uses_selected_state_and_native_control_without_context(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state = Path(folder) / 'selected state'
+            save_config(state, {'sshHost': 'my-relay', 'url': 'https://relay.example.com', 'control': True})
+            with patch.dict(os.environ), patch.object(sys, 'argv', []), \
+                    patch('companion.ensure_tray'), patch('sync_supervisor.main') as main:
+                companion.supervise(state)
+                self.assertEqual(os.environ['CODEX_SUIXING_STATE_DIR'], str(state))
+                self.assertEqual(os.environ['CODEX_SUIXING_CONTEXT_THREAD_ID'], '')
+                self.assertIn('--control', sys.argv)
+                self.assertEqual(sys.argv[sys.argv.index('--data-dir') + 1], str(state))
+                main.assert_called_once_with()
+
     def test_private_config_and_no_shared_context(self):
         with tempfile.TemporaryDirectory() as folder:
             state = Path(folder) / "private data"
@@ -23,9 +36,10 @@ class CompanionTests(unittest.TestCase):
             if os.name != "nt":
                 self.assertEqual((state / "connection.json").stat().st_mode & 0o777, 0o600)
             for values in [{"sshHost": "-oProxyCommand=bad"}, {"url": "https://user:pass@example.com"},
-                           {"url": "http://example.com"}, {"control": True}, {"contextThreadId": "not-a-uuid"}]:
+                           {"url": "http://example.com"}, {"control": "yes"}, {"contextThreadId": "not-a-uuid"}]:
                 with self.assertRaises(ValueError):
                     validate({**config, **values})
+            self.assertTrue(validate({**config, "control": True})['control'])
 
     def test_macos_paths_and_launch_agent_arguments(self):
         home = Path("/Users/example")

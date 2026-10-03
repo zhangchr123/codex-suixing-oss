@@ -21,11 +21,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - run: python -m pip install Pillow
       - run: python -m unittest -v
       - run: node test_desktop.mjs
       - run: node test_chatgpt.mjs
       - run: node test_markdown.cjs
       - run: node test_polling.cjs
+      - run: node test_timeline.cjs
+      - run: node test_formatting.cjs
+      - run: node test_math.cjs
       - run: python scripts/audit_source.py
       - name: Check macOS launcher and LaunchAgent
         if: runner.os == 'macOS'
